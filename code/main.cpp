@@ -26,6 +26,7 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 #include <nebula/foundation/qlog.h>
 #include <nebula/foundation/random.h>
 #include <nebula/foundation/utf.h>
+#include <nebula/foundation/expect.h>
 #include <nebula/sex/sex.h>
 #include <nebula/crypt/crypt.h>
 
@@ -82,7 +83,25 @@ inline void print_help(const fnd::const_cstring argv0)
         program_description, fmt::endl,
         "Please send bugreports to ", program_bugreport, fmt::endl, fmt::endl,
         
-"Usage: ", argv0, " [OPTION]...", fmt::endl, fmt::endl,
+"Usage: ", argv0, " [OPTION | CONFIG]...", fmt::endl, fmt::endl,
+
+"CONFIG is a simple script to add character ranges to the input set.", fmt::endl,
+"The following example should be self-explenatory.", fmt::endl, fmt::endl,
+
+"  (A Z) // Add the letters A, B, C, ..., Y, Z.", fmt::endl,
+"  (a z)(0 9) // Add lower case letters and digits.", fmt::endl,
+"  (U+0041 U+005A) // Same as (A Z).", fmt::endl,
+"  (U+0041 Z) // Same as (A Z).", fmt::endl,
+"  (U+41 Z) // Leading zeros can be omitted.", fmt::endl,
+"  (A) // Add only a single letter.", fmt::endl, fmt::endl,
+
+"  // Characters other than (A Z)(a z)(0 9) must be put inside double quotes:", fmt::endl,
+"  (\"あ\" \"わ\")", fmt::endl, fmt::endl,
+
+"  // Comment", fmt::endl,
+"  /* Multiline", fmt::endl,
+"   * Comment", fmt::endl,
+"   */", fmt::endl, fmt::endl,
 
 "Below is a list of available OPTIONs. Each OPTION can be indicated with both", fmt::endl,
 "a single dash '-' or a double dash '--'. So '-help' is equivalent to '--help'.", fmt::endl, fmt::endl,
@@ -101,36 +120,24 @@ inline void print_help(const fnd::const_cstring argv0)
 "                       Drains the system's entropy pool!", fmt::endl,
 "                   crypt-strong ... Like strong but using Nebula.Crypt.", fmt::endl,
 "                   crypt-very-strong ... You get the idea.", fmt::endl,
-"-n --numeric-range     Parse one or more 'ranges' of the form '(N M)'", fmt::endl,
-"                       where N and M are decimal numbers such that N <= M.", fmt::endl,
-"                       (N) is the same as (N N).", fmt::endl,
-"                       Random values will be picked from the given ranges.", fmt::endl,
-"-u --unicode-range     Same as --numeric-range but accepts '(A B)' where ", fmt::endl,
-"                       A and B are unicode characters instead.", fmt::endl,
-"                       For example (A Z) would be the range (65 90).", fmt::endl,
-"                       (A) is the same as (A A).", fmt::endl,
-"-A --AZ        Add the range (A Z): ABCDEFGHIJKLMNOPQRSTUVWXYZ", fmt::endl,
-"-a --az        Add the range (a z): abcdefghijklmnopqrstuvwxyz", fmt::endl,
-"-0 --09        Add the range (0 9): 0123456789", fmt::endl,
-"-x             Add the range: !\"#$%&'()*+,-./:;<=>?@[\\]^_`{|}~", fmt::endl,
+"-c --config    Load a config file.", fmt::endl,
+"-A --AZ        Add (A Z): ABCDEFGHIJKLMNOPQRSTUVWXYZ", fmt::endl,
+"-a --az        Add (a z): abcdefghijklmnopqrstuvwxyz", fmt::endl,
+"-0 --09        Add (0 9): 0123456789", fmt::endl,
+"-x             Add: !\"#$%&'()*+,-./:;<=>?@[\\]^_`{|}~", fmt::endl,
 "--show-ascii   Print a simple ASCII table and exit.", fmt::endl, fmt::endl,
 
 "NOTE: This program works with UTF-8 strings only.", fmt::endl,
-"NOTE: Adding the same range N times increases the likelihood of a character", fmt::endl,
-"being picked from it by N times.", fmt::endl,
-"NOTE: Characters consisting of more than one UTF-8 codeunit must be", fmt::endl,
-"placed inside double-quotes like: (\"あ\" \"わ\").", fmt::endl, fmt::endl,
-
-"The following examples are equivalent.", fmt::endl,
-"    # ", argv0, " -n='(65 90)(97 122)(48 57)'", fmt::endl,
-"    # ", argv0, " -u='(A Z)(a z)(0 9)'", fmt::endl,
-"    # ", argv0, " -AZ -az -09", fmt::endl);
+"NOTE: The program doesn't check if a character has already been added.", fmt::endl,
+"      Adding characters multiple times (through overlapping ranges) increases", fmt::endl,
+"      the relative likelihood that it gets picked.", fmt::endl);
 }
 //------------------------------------------------------------------------------
 inline void print_ascii_table()
 {
     auto f = [&] (const size_t beg, const size_t end) {
-        fmt::fwrite(io::cout, '(', beg, ' ', end, "): ");
+        fmt::fwrite(io::cout,
+            '(', "U+", fmt::hex(beg), " U+", fmt::hex(end), "): ");
         for(size_t i = beg; i <= end; ++i)
             io::put(io::cout, static_cast<char>(i));
         fmt::fwrite(io::cout, fmt::endl);
@@ -189,6 +196,8 @@ enum class errc
 {
     unknown = -1,
     success = 0,
+    
+    // Parsing errors
     expected_lbracket,
     expected_rbracket,
     expected_string,
@@ -196,9 +205,26 @@ enum class errc
     invalid_range,
     inverted_range,
     expected_single_character,
-    invalid_utf32
+    
+    // Mapped sex errors
+    unexpected_eof,
+    invalid_token,
+    stray_rbracket,
+    missing_rbracket,
+    unexpected_token
 };
-
+//------------------------------------------------------------------------------
+inline errc to_errc(const sex::errc x) noexcept {
+    switch(x)
+    {
+    case sex::errc::unexpected_eof: return errc::unexpected_eof;
+    case sex::errc::invalid_token: return errc::invalid_token;
+    case sex::errc::stray_rbracket: return errc::stray_rbracket;
+    case sex::errc::missing_rbracket: return errc::missing_rbracket;
+    case sex::errc::unexpected_token: return errc::unexpected_token;
+    default: return errc::unknown;
+    }
+}
 //------------------------------------------------------------------------------
 class app_error_category_impl : public fnd::system::error_category
 {
@@ -217,21 +243,29 @@ public:
         case static_cast<errval_t>(errc::success):
             return "Everything went fine.";
         case static_cast<errval_t>(errc::expected_lbracket):
-            return "Missing left bracket.";
+            return "Expected left bracket.";
         case static_cast<errval_t>(errc::expected_rbracket):
-            return "Missing right bracket.";
+            return "Expected right bracket.";
         case static_cast<errval_t>(errc::expected_string):
             return "Expected a String.";
         case static_cast<errval_t>(errc::invalid_number):
-            return "Expected a number in the range [0 2097151].";
+            return "Expected a number in the range (U+0 U+1FFFFF).";
         case static_cast<errval_t>(errc::invalid_range):
             return "The range is not valid.";
         case static_cast<errval_t>(errc::inverted_range):
             return "The range is inverted.";
         case static_cast<errval_t>(errc::expected_single_character):
             return "Expected a single character.";
-        case static_cast<errval_t>(errc::invalid_utf32):
-            return "Invalid unicode value. Allowed range: (0 2097151)";
+        case static_cast<errval_t>(errc::unexpected_eof):
+            return "Unexpected EOF.";
+        case static_cast<errval_t>(errc::invalid_token):
+            return "Invalid token.";
+        case static_cast<errval_t>(errc::stray_rbracket):
+            return "Stray right bracket ')' without a matching '('.";
+        case static_cast<errval_t>(errc::missing_rbracket):
+            return "Missing right bracket ')'.";
+        case static_cast<errval_t>(errc::unexpected_token):
+            return "Unexpected token.";
         default: return "unknown";
         }
     }
@@ -253,7 +287,6 @@ const fnd::system::error_category &app_error_category() noexcept {
 n_register_error_code_enum(::errc, ::app_error_category());
 n_register_error_condition_enum(::errc, ::app_error_category());
 
-
 //------------------------------------------------------------------------------
 enum class random_mode
 {
@@ -264,85 +297,41 @@ enum class random_mode
 };
 
 //------------------------------------------------------------------------------
-inline errc parse_numeric_range(
-    const fnd::const_cstring s,
-    fnd::vector<fnd::array<char32_t, 2>> &v)
+inline fnd::expect<char32_t, errc> parse_value(fnd::const_cstring s)
 {
-    sex::iterative_parser<fnd::const_cstring> sexp(s);
+    if(s.empty())
+        return errc::expected_string;
     
-    while(true)
+    if('U' == s[0] && s.size() > 1)
     {
-        fnd::optional<sex::token> tok_ = sexp();
-        if(!tok_.valid())
-        {
-            return errc::unknown;
-        }
-        sex::token tok = tok_.get();
-        if(sex::token_id::eof == tok.id())
-            break;
-        else if(sex::token_id::lbracket != tok.id())
-        {
-            return errc::expected_lbracket;
-        }
-        
-        auto r = sexp.parse_string();
-        if(!r.valid())
-        {
-            return errc::expected_string;
-        }
-        
-        auto ir = fmt::to_integer<char32_t>(r.get(), 10, fnd::nothrow_tag());
-        if(!ir.valid())
-        {
+        if(s.size() < 3)
             return errc::invalid_number;
-        }
-        const char32_t beg = ir.get();
-        char32_t end = beg;
-        
-        tok_ = sexp();
-        if(!tok_.valid())
+        if('+' == s[1])
         {
-            return errc::unknown;
-        }
-        tok = tok_.get();
-        if(sex::token_id::string == tok.id())
-        {
-            ir = fmt::to_integer<char32_t>(tok.value(), 10, fnd::nothrow_tag());
-            if(!ir.valid())
-            {
+            s = {s.begin() + 2, s.end()};
+            const char *i = fnd::range::find(s, '0', fnd::not_equal_to<>());
+            if(s.end() == i)
+                return static_cast<char32_t>(0);
+            auto r = fnd::fmt::to_integer<uint32_t>(
+                {i, s.end()}, 16, fnd::nothrow_tag());
+            if(!r.valid())
                 return errc::invalid_number;
-            }
-            end = ir.get();
-            
-            tok_ = sexp();
-            if(!tok_.valid())
-            {
-                return errc::unknown;
-            }
-            tok = tok_.get();
+            if(2097151 < r.get())
+                return errc::invalid_number;
+            return static_cast<char32_t>(r.get());
         }
-        
-        if(beg > end)
-        {
-            return errc::inverted_range;
-        }
-        if(end > 2097151) // unicode range
-        {
+        else
             return errc::invalid_number;
-        }
-        
-        if(sex::token_id::rbracket != tok.id())
-        {
-            return errc::expected_rbracket;
-        }
-        
-        v.emplace_back(fnd::array<char32_t, 2>{beg, end + 1});
     }
-    
-    return errc::success;
+    else
+    {
+        if(fnd::utf::unsafe_count(s) != 1)
+            return errc::expected_single_character;
+        return fnd::utf::widen(s);
+    }
 }
 //------------------------------------------------------------------------------
-inline errc parse_unicode_range(
+inline fnd::tuple<errc, size_t> parse_config(
     const fnd::const_cstring s,
     fnd::vector<fnd::array<char32_t, 2>> &v)
 {
@@ -352,74 +341,55 @@ inline errc parse_unicode_range(
     {
         fnd::optional<sex::token> tok_ = sexp();
         if(!tok_.valid())
-        {
-            return errc::unknown;
-        }
+            return {to_errc(sexp.error()), sexp.position()};
         sex::token tok = tok_.get();
         if(sex::token_id::eof == tok.id())
             break;
         else if(sex::token_id::lbracket != tok.id())
-        {
-            return errc::expected_lbracket;
-        }
+            return {errc::expected_lbracket, tok.value().begin() - s.begin()};
         
         auto r = sexp.parse_any_string();
         if(!r.valid())
-        {
-            return errc::expected_string;
-        }
+            return {to_errc(sexp.error()), sexp.position()};
         
-        fnd::const_cstring c_ = r.get();
-        if(1 != fnd::utf::count(c_))
+        char32_t beg = 0;
         {
-            return errc::expected_single_character;
+            auto ret = parse_value(r.get());
+            if(!ret.valid())
+                return {ret.error(), r.get().begin() - s.begin()};
+            beg = ret.get();
         }
-        const char32_t beg = fnd::utf::widen(c_);
         char32_t end = beg;
         
         tok_ = sexp();
         if(!tok_.valid())
-        {
-            return errc::unknown;
-        }
+            return {to_errc(sexp.error()), sexp.position()};
         tok = tok_.get();
         if(sex::token_id::string == tok.id()
             || sex::token_id::quoted_string == tok.id()
             || sex::token_id::data == tok.id())
         {
-            c_ = tok.value();
-            if(1 != fnd::utf::count(c_))
-            {
-                return errc::expected_single_character;
-            }
-            end = fnd::utf::widen(c_);
+            auto ret = parse_value(tok.value());
+            if(!ret.valid())
+                return {ret.error(), tok.value().begin() - s.begin()};
+            end = ret.get();
+            
+            if(beg > end)
+                return {errc::inverted_range, tok.value().begin() - s.begin()};
             
             tok_ = sexp();
             if(!tok_.valid())
-            {
-                return errc::unknown;
-            }
+                return {to_errc(sexp.error()), sexp.position()};
             tok = tok_.get();
         }
         
-        if(beg > end)
-        {
-            return errc::inverted_range;
-        }
-        if(char32_t(-1) == end)
-        {
-            return errc::invalid_range;
-        }
-        
         if(sex::token_id::rbracket != tok.id())
-        {
-            return errc::expected_rbracket;
-        }
+            return {errc::expected_rbracket, tok.value().begin() - s.begin()};
         
         v.emplace_back(fnd::array<char32_t, 2>{beg, end + 1});
     }
     
-    return errc::success;
+    return {errc::success, 0};
 }
 
 //------------------------------------------------------------------------------
@@ -515,10 +485,25 @@ int main(int argc, char **argv)
                 quit = EXIT_FAILURE;
                 gl->error("Unknown parameter: '-", id, "'.");
             },
-            [&] (fnd::const_cstring val, const size_t i) {
-                if(i > 0) {
+            [&] (fnd::const_cstring val, const size_t i) {  
+                if(0 == i)
+                    return true;
+                if(val.empty())
+                {
+                    gl->info("Ignoring argument ", i-1, " which is empty.");
+                    return true;
+                }
+                errc err;
+                size_t pos;
+                fnd::tie(err, pos) = parse_config(val, ranges);
+                if(errc::success != err) {
                     quit = EXIT_FAILURE;
-                    gl->error("Arguments without - or -- are not allowed.");
+                    gl->error(
+                        fnd::system::error_code(err).message(),
+                        fmt::endl,
+                        fnd::const_cstring{val.begin(), val.begin()+pos},
+                        " ERROR --> ",
+                        fnd::const_cstring{val.begin()+pos, val.end()});
                     return false;
                 }
                 return true;
@@ -595,7 +580,7 @@ int main(int argc, char **argv)
                     if(!x.valid())
                     {
                         quit = EXIT_FAILURE;
-                        gl->error("Expected positive number. '-",
+                        gl->error("Invalid number. '-",
                             id, "=#ERROR'");
                         return false;
                     }
@@ -611,42 +596,6 @@ int main(int argc, char **argv)
                     return true;
                 },
                 "raw", "w"),
-            fnd::opts::argument(
-                [&] (fnd::const_cstring id, fnd::const_cstring val, size_t i) {
-                    if(val.empty())
-                    {
-                        quit = EXIT_FAILURE;
-                        gl->error("Missing value. '-", id, "=???'.");
-                        return false;
-                    }
-                    const errc err = parse_numeric_range(val, ranges);
-                    if(errc::success != err) {
-                        quit = EXIT_FAILURE;
-                        gl->error("'-", id, "=#ERROR'; ",
-                            fnd::system::error_code(err).message());
-                        return false;
-                    }
-                    return true;
-                },
-                "numeric-range", "n"),
-            fnd::opts::argument(
-                [&] (fnd::const_cstring id, fnd::const_cstring val, size_t i) {
-                    if(val.empty())
-                    {
-                        quit = EXIT_FAILURE;
-                        gl->error("Missing value. '-", id, "=???'.");
-                        return false;
-                    }
-                    const errc err = parse_unicode_range(val, ranges);
-                    if(errc::success != err) {
-                        quit = EXIT_FAILURE;
-                        gl->error("'-", id, "=#ERROR'; ",
-                            fnd::system::error_code(err).message());
-                        return false;
-                    }
-                    return true;
-                },
-                "unicode-range", "u"),
             fnd::opts::argument(
                 [&] (fnd::const_cstring id, fnd::const_cstring val, size_t i) {
                     if(!val.empty())
@@ -682,6 +631,61 @@ int main(int argc, char **argv)
                     return true;
                 },
                 "special", "x"),
+            
+            fnd::opts::argument(
+                [&] (fnd::const_cstring id, fnd::const_cstring val, size_t i) {
+                    if(val.empty())
+                    {
+                        quit = EXIT_FAILURE;
+                        gl->error("Missing value. '-", id, "=???'.");
+                        return false;
+                    }
+                    fnd::io::ifstream f;
+                    try {
+                        f.open(val);
+                    } catch(...) {
+                        gl->error("Unable to open config file '", val, "'. ",
+                            "Ensure that it exists and is readable.");
+                        gl->debug(fnd::diagnostic_information(
+                            fnd::current_exception()));
+                        quit = EXIT_FAILURE;
+                        return false;
+                    }
+                    fnd::io::seekg_end(f, 0);
+                    const size_t n = fnd::io::tellg(f);
+                    fnd::io::seekg_beg(f, 0);
+                    fnd::string buf;
+                    buf.resize(n);
+                    fnd::io::read(f, buf.data(), buf.size());
+                    errc err;
+                    size_t pos;
+                    fnd::tie(err, pos) = parse_config(buf, ranges);
+                    if(errc::success != err) {
+                        quit = EXIT_FAILURE;
+                        size_t nline = fnd::iterator::count(
+                            buf.begin(), buf.begin()+pos, '\n');
+                        fnd::const_cstring line{buf.begin(), buf.begin()+pos};
+                        line = {
+                            fnd::range::find(
+                                line | fnd::range::adaptor::reverse(),
+                                '\n').get(),
+                            line.end()};
+                        fnd::const_cstring line2{buf.begin()+pos, buf.end()};
+                        line2 = {
+                            line2.begin(),
+                            fnd::range::find(line2, '\n')};
+                        gl->error("Error in file '", val, "' at line ",
+                            nline + 1, ": ",
+                            fnd::system::error_code(err).message(),
+                            fmt::endl,
+                            line,
+                            " ERROR --> ",
+                            line2);
+                        return false;
+                    }
+                    return true;
+                },
+                "config", "c"),
             
             fnd::opts::argument(
                 [&] (fnd::const_cstring id, fnd::const_cstring val, size_t i) {
@@ -822,19 +826,6 @@ int main(int argc, char **argv)
             
             fmt::fwrite(io::cout, fmt::endl);
         }
-    }
-    catch(const fnd::exception &e)
-    {
-        const fnd::ei_msg *msg = fnd::get_error_info<fnd::ei_msg>(e);
-        const fnd::ei_msg_c *msg_c = fnd::get_error_info<fnd::ei_msg_c>(e);
-        
-        gl->fatal("Internal Error");
-        if(msg)
-            gl->fatal(msg->value());
-        if(msg_c)
-            gl->fatal(msg_c->value());
-        gl->debug(fnd::diagnostic_information(e));
-        return EXIT_FAILURE;
     }
     catch(...)
     {
